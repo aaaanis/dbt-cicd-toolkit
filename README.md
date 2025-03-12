@@ -1,4 +1,4 @@
-# dbt-ci-cd-toolkit
+# dbt ci/cd toolkit
 
 A comprehensive toolkit for implementing advanced CI/CD patterns with dbt.
 
