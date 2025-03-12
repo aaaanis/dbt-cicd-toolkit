@@ -1,0 +1,42 @@
+version: 2
+
+models:
+  - name: reference_model
+    description: "Reference model to showcase the dbt-ci-cd-toolkit package capabilities"
+    columns:
+      - name: id
+        description: "Unique identifier for the customer"
+        tests:
+          - unique
+          - not_null
+      
+      - name: name
+        description: "Customer name"
+        tests:
+          - not_null
+      
+      - name: segment
+        description: "Customer segment (Retail, Wholesale)"
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['Retail', 'Wholesale']
+      
+      - name: value
+        description: "Customer value in USD"
+        tests:
+          - not_null
+
+      - name: created_date
+        description: "Date when the customer was created"
+        tests:
+          - not_null
+          
+      - name: projected_value
+        description: "Projected customer value with 10% growth"
+        
+      - name: business_type
+        description: "Business type (B2B or B2C)"
+        tests:
+          - accepted_values:
+              values: ['B2B', 'B2C', 'Other'] 

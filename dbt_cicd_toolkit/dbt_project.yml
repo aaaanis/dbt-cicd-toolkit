@@ -1,0 +1,43 @@
+name: 'dbt_cicd_toolkit'
+version: '0.1.0'
+config-version: 2
+
+require-dbt-version: ">=1.0.0"
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  dbt_cicd_toolkit:
+    +materialized: view
+    testing:
+      +materialized: table
+      +schema: cicd_analytics
+    reference:
+      +materialized: table
+      +schema: reference
+
+vars:
+  dbt_cicd_toolkit:
+    # Default configurations
+    enable_impact_analysis: true
+    enable_selective_testing: true
+    enable_environment_promotion: true
+    enable_pipeline_visualization: true
+    enable_testing_dashboard: true
+    enable_version_management: true
+    default_test_level: 'minimal'  # Options: 'minimal', 'standard', 'comprehensive'
+    
+    # Test coverage goals
+    test_coverage_goals:
+      model_coverage_pct: 80.0  # Aim for 80% of models to have tests
+      test_pass_rate: 95.0      # Aim for 95% test pass rate 

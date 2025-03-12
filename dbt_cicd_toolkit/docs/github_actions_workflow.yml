@@ -1,0 +1,264 @@
+name: dbt CI/CD Production Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+        - development
+        - staging
+        - production
+
+jobs:
+  validate:
+    name: Validate and Impact Analysis
+    runs-on: ubuntu-latest
+    outputs:
+      changed_files: ${{ steps.get-changed-files.outputs.changed_files }}
+      impacted_models: ${{ steps.impact-analysis.outputs.impacted_models }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Fetch all history for proper comparison
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install dbt-core dbt-snowflake
+          pip install -r requirements.txt
+          dbt deps
+      
+      - name: Get changed files
+        id: get-changed-files
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            # For PRs, compare with the base branch
+            CHANGED_FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }} | grep '\.sql$' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          else
+            # For pushes, compare with the previous commit
+            CHANGED_FILES=$(git diff --name-only HEAD^ HEAD | grep '\.sql$' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          fi
+          
+          echo "changed_files=$CHANGED_FILES" >> $GITHUB_OUTPUT
+          echo "Changed SQL files: $CHANGED_FILES"
+      
+      - name: Run Impact Analysis
+        id: impact-analysis
+        run: |
+          # Run impact analysis to find affected models
+          IMPACTED_MODELS=$(dbt run-operation dbt_cicd_toolkit.get_impacted_models --args "{source_files: ${{ steps.get-changed-files.outputs.changed_files }}}" --quiet)
+          
+          echo "impacted_models=$IMPACTED_MODELS" >> $GITHUB_OUTPUT
+          echo "Impacted models: $IMPACTED_MODELS"
+      
+      - name: Generate Pipeline Visualization
+        run: |
+          # Generate pipeline graph for impacted models
+          dbt run-operation dbt_cicd_toolkit.generate_pipeline_graph --args "{model_selection: ${{ steps.impact-analysis.outputs.impacted_models }}, output_format: 'mermaid'}" > pipeline_graph.md
+      
+      - name: Add Pipeline Graph to PR
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: pipeline-visualization
+          message: |
+            ## Pipeline Impact Visualization
+            
+            The following diagram shows the models affected by this PR and their dependencies:
+            
+            ```mermaid
+            ${{ secrets.cat 'pipeline_graph.md' }}
+            ```
+
+  test:
+    name: Selective Testing
+    needs: validate
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install dbt-core dbt-snowflake
+          pip install -r requirements.txt
+          dbt deps
+      
+      - name: Run Selective Tests
+        run: |
+          # Run tests on impacted models with comprehensive test level
+          dbt run-operation dbt_cicd_toolkit.run_selective_tests --args "{changed_files: ${{ needs.validate.outputs.changed_files }}, test_level: 'comprehensive'}"
+
+      - name: Generate Test Coverage Dashboard
+        run: |
+          # Build the test coverage dashboard
+          dbt run --select test_coverage_dashboard
+      
+      - name: Check Test Coverage
+        run: |
+          # Extract test coverage metrics
+          MODEL_COVERAGE=$(python dbt_cicd_toolkit/scripts/extract_test_coverage.py --metric model_coverage_pct)
+          TEST_PASS_RATE=$(python dbt_cicd_toolkit/scripts/extract_test_coverage.py --metric test_pass_rate)
+          
+          echo "Model coverage: $MODEL_COVERAGE%"
+          echo "Test pass rate: $TEST_PASS_RATE%"
+          
+          # Check against goals
+          if (( $(echo "$MODEL_COVERAGE < 80.0" | bc -l) )); then
+            echo "⚠️ Warning: Model coverage is below goal of 80%"
+          fi
+          
+          if (( $(echo "$TEST_PASS_RATE < 95.0" | bc -l) )); then
+            echo "⚠️ Warning: Test pass rate is below goal of 95%"
+          fi
+
+  deploy_development:
+    name: Deploy to Development
+    needs: [validate, test]
+    if: github.ref == 'refs/heads/develop' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'development')
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install dbt-core dbt-snowflake
+          pip install -r requirements.txt
+          dbt deps
+      
+      - name: Register Version
+        run: |
+          # For each impacted model, register a new version
+          for MODEL in $(echo ${{ needs.validate.outputs.impacted_models }} | jq -r '.[]'); do
+            # Get current version and bump minor version
+            CURRENT_VERSION=$(dbt run-operation dbt_cicd_toolkit.get_latest_version --args "{model_name: '$MODEL'}" --quiet)
+            
+            # Simple version bumping logic (in production, use a proper semver tool)
+            MAJOR=$(echo $CURRENT_VERSION | cut -d. -f1)
+            MINOR=$(echo $CURRENT_VERSION | cut -d. -f2)
+            PATCH=$(echo $CURRENT_VERSION | cut -d. -f3)
+            NEW_VERSION="$MAJOR.$((MINOR+1)).$PATCH"
+            
+            # Register new version
+            dbt run-operation dbt_cicd_toolkit.register_version --args "{model_name: '$MODEL', version: '$NEW_VERSION', description: 'Updated via CI/CD pipeline', author: '${{ github.actor }}'}"
+          done
+      
+      - name: Promote to Development
+        run: |
+          # Promote impacted models to development
+          dbt run-operation dbt_cicd_toolkit.promote_to_environment --args "{target_environment: 'development', models: ${{ needs.validate.outputs.impacted_models }}}"
+
+  deploy_staging:
+    name: Deploy to Staging
+    needs: [validate, test, deploy_development]
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install dbt-core dbt-snowflake
+          pip install -r requirements.txt
+          dbt deps
+      
+      - name: Check for Breaking Changes
+        run: |
+          # Check each model for breaking changes
+          BREAKING_CHANGES=false
+          
+          for MODEL in $(echo ${{ needs.validate.outputs.impacted_models }} | jq -r '.[]'); do
+            LATEST_VERSION=$(dbt run-operation dbt_cicd_toolkit.get_latest_version --args "{model_name: '$MODEL'}" --quiet)
+            IS_BREAKING=$(dbt run-operation dbt_cicd_toolkit.check_breaking_version --args "{model_name: '$MODEL', version: '$LATEST_VERSION'}" --quiet)
+            
+            if [[ "$IS_BREAKING" == "true" ]]; then
+              echo "⚠️ Warning: $MODEL version $LATEST_VERSION contains breaking changes!"
+              BREAKING_CHANGES=true
+            fi
+          done
+          
+          if [[ "$BREAKING_CHANGES" == "true" ]]; then
+            echo "Models with breaking changes will require manual review before promotion to production."
+          fi
+      
+      - name: Promote to Staging
+        run: |
+          # Promote impacted models to staging
+          dbt run-operation dbt_cicd_toolkit.promote_to_environment --args "{target_environment: 'staging', models: ${{ needs.validate.outputs.impacted_models }}}"
+
+  deploy_production:
+    name: Deploy to Production
+    needs: [validate, test, deploy_staging]
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
+    runs-on: ubuntu-latest
+    environment: production  # Requires approval
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install dbt-core dbt-snowflake
+          pip install -r requirements.txt
+          dbt deps
+      
+      - name: Final Validation
+        run: |
+          # Run comprehensive tests on all models before production deployment
+          dbt test
+      
+      - name: Promote to Production
+        run: |
+          # Promote impacted models to production
+          dbt run-operation dbt_cicd_toolkit.promote_to_environment --args "{target_environment: 'production', models: ${{ needs.validate.outputs.impacted_models }}}"
+          
+          # Deploy latest versions to production for each model
+          for MODEL in $(echo ${{ needs.validate.outputs.impacted_models }} | jq -r '.[]'); do
+            LATEST_VERSION=$(dbt run-operation dbt_cicd_toolkit.get_latest_version --args "{model_name: '$MODEL'}" --quiet)
+            dbt run-operation dbt_cicd_toolkit.deploy_version --args "{model_name: '$MODEL', version: '$LATEST_VERSION', environment: 'production'}"
+          done 
